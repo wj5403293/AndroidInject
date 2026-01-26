@@ -31,6 +31,9 @@ public:
     // 查找符号
     uintptr_t findSymbol(const std::string& name) const;
     
+    // 手动设置基址（如果从文件加载但需要指定运行时基址）
+    void setBase(uintptr_t base);
+    
     // 获取文件路径
     const std::string& filePath() const { return m_filePath; }
     
@@ -97,4 +100,9 @@ private:
     // 用于远程读取
     pid_t m_remotePid = 0;
     std::vector<uint8_t> m_localData;
+    
+    // 本地符号表（从文件解析）
+    uintptr_t m_localSymtabOffset = 0;
+    size_t m_localSymCount = 0;
+    uintptr_t m_localStrtabOffset = 0;
 };

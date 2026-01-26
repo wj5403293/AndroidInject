@@ -1,9 +1,46 @@
 #include "SolistHider.h"
 #include "Utils.h"
 #include <cstring>
+#include <string>
 #include <dlfcn.h>
 #include <link.h>
-#include <fstream>
+
+
+
+/*
+
+
+__dl__Z17solist_add_soinfoP6soinfo  
+; __unwind {
+                ADRP            X8, #__dl__ZL6sonext@PAGE ; Alternative name is '__dl_$x'
+                LDR             X9, [X8,#__dl__ZL6sonext@PAGEOFF]
+                STR             X0, [X8,#__dl__ZL6sonext@PAGEOFF]
+                STR             X0, [X9,#0x28]
+                RET
+; } 
+
+__dl__Z15solist_get_headv                        
+; __unwind {
+                ADRP            X8, #__dl__ZL6solist@PAGE ; Alternative name is '__dl_$x'
+                LDR             X0, [X8,#__dl__ZL6solist@PAGEOFF]
+                RET
+; } 
+
+__dl__Z17solist_get_somainv                    
+; __unwind {
+                ADRP            X8, #__dl__ZL6somain@PAGE ; Alternative name is '__dl_$x'
+                LDR             X0, [X8,#__dl__ZL6somain@PAGEOFF]
+                RET
+; } 
+
+*/
+
+
+
+
+
+
+
 
 SolistHider::SolistHider(RemoteProcess* remote) : m_remote(remote) {}
 
@@ -19,9 +56,23 @@ bool SolistHider::init() {
         return false;
     }
     
-    if (!m_linkerElf.loadFromMemory(m_remote->pid(), linkerMap.start)) {
-        LOGE("Failed to parse linker ELF");
-        return false;
+    // 优先尝试从文件加载 linker 的符号表（以便获取本地/静态符号）
+    if (!linkerMap.path.empty() && Utils::fileExists(linkerMap.path)) {
+        if (m_linkerElf.loadFromFile(linkerMap.path)) {
+            // 设置运行时基址，用于将符号值转换为运行时地址
+            m_linkerElf.setBase(linkerMap.start);
+        } else {
+            // 回退到从内存解析
+            if (!m_linkerElf.loadFromMemory(m_remote->pid(), linkerMap.start)) {
+                LOGE("Failed to parse linker ELF from memory");
+                return false;
+            }
+        }
+    } else {
+        if (!m_linkerElf.loadFromMemory(m_remote->pid(), linkerMap.start)) {
+            LOGE("Failed to parse linker ELF");
+            return false;
+        }
     }
     
     LOGI("Linker base: %p", (void*)m_linkerElf.base());
@@ -48,73 +99,162 @@ bool SolistHider::findLinkerSymbols() {
             return findSoinfoOffsets(solist);
         }
     }
-    
-    // 方法2: 通过内存扫描查找
-    // 这需要更复杂的实现，暂时跳过
+    // 方法2: per-function ADRP 解析（三个独立解析函数）
+
+    // 解析 __dl__Z17solist_add_soinfoP6soinfo -> sonext
+    uintptr_t addr = m_linkerElf.findSymbol("__dl__Z17solist_add_soinfoP6soinfo");
+    if (addr && parseSolistAddSoinfo(addr)) {
+        LOGI("Found sonext via __dl__Z17solist_add_soinfoP6soinfo");
+    }
+
+    // 解析 __dl__Z15solist_get_headv -> solist
+    addr = m_linkerElf.findSymbol("__dl__Z15solist_get_headv");
+    if (addr && parseSolistGetHead(addr)) {
+        LOGI("Found solist via __dl__Z15solist_get_headv");
+    }
+
+    // // 解析 __dl__Z17solist_get_somainv -> solist
+    // addr = m_linkerElf.findSymbol("__dl__Z17solist_get_somainv");
+    // if (addr && parseSolistGetSomain(addr)) {
+    //     LOGI("Found solist via __dl__Z17solist_get_somainv");
+    // }
+
+    if (m_solistAddr && m_sonextAddr) {
+        LOGI("Found solist: %p, sonext: %p (by ADRP parsing)", (void*)m_solistAddr, (void*)m_sonextAddr);
+        uintptr_t solist = 0;
+        m_remote->readMemory(m_solistAddr, &solist, sizeof(solist));
+        if (solist) return findSoinfoOffsets(solist);
+    }
+
     LOGW("Cannot find linker symbols, solist hiding may not work");
     return false;
 }
 
 bool SolistHider::findSoinfoOffsets(uintptr_t soinfo) {
+    // 使用固定偏移：base=0x10, next=0x28
     if (!soinfo) return false;
-    
-    // 读取 soinfo 结构的前 256 字节
-    uint8_t buf[256];
-    if (m_remote->readMemory(soinfo, buf, sizeof(buf)) != sizeof(buf)) {
+    m_offsets.base = 0x10;
+    m_offsets.next = 0x28;
+    m_nextIsIndirect = false;
+
+    // 验证 solist 中第二个 soinfo 的 ELF 魔数（提高可信度）
+    uintptr_t secondSoinfo = 0;
+    if (m_remote->readMemory(soinfo + m_offsets.next, &secondSoinfo, sizeof(secondSoinfo)) != sizeof(secondSoinfo) || secondSoinfo == 0) {
+        LOGW("Using fixed soinfo offsets but cannot read second soinfo at soinfo+0x28");
+        m_offsets.valid = true;
+        return true;
+    }
+
+    uintptr_t secondBase = 0;
+    if (m_remote->readMemory(secondSoinfo + m_offsets.base, &secondBase, sizeof(secondBase)) != sizeof(secondBase) || secondBase == 0) {
+        LOGW("Using fixed soinfo offsets but cannot read base of second soinfo");
+        m_offsets.valid = true;
+        return true;
+    }
+
+    uint8_t magic[4];
+    if (m_remote->readMemory(secondBase, magic, 4) == 4 && memcmp(magic, ELFMAG, SELFMAG) == 0) {
+        m_offsets.valid = true;
+        LOGI("Verified second soinfo base %p using fixed offsets", (void*)secondBase);
+    } else {
+        m_offsets.valid = true;
+        LOGW("Fixed offsets used but ELF magic invalid at second soinfo base %p", (void*)secondBase);
+    }
+
+    return true;
+}
+
+// Helper: decode ADRP immediate (page)
+static uintptr_t decodeAdrpImmStatic(uint32_t insn, uintptr_t insnAddr) {
+    uint32_t immlo = (insn >> 29) & 0x3;
+    uint32_t immhi = (insn >> 5) & 0x7FFFF;
+    int64_t imm21 = (int64_t)((immhi << 2) | immlo);
+    if (imm21 & (1 << 20)) imm21 |= ~((1 << 21) - 1);
+    int64_t page = ((int64_t)insnAddr & ~0xFFFLL) + (imm21 << 12);
+    return (uintptr_t)page;
+}
+
+bool SolistHider::parseSolistGetHead(uintptr_t funcAddr) {
+    const size_t READ_BYTES = 40;
+    std::vector<uint8_t> code(READ_BYTES);
+    if (m_remote->readMemory(funcAddr, code.data(), code.size()) != (ssize_t)code.size()) {
         return false;
     }
-    
-    // soinfo 结构大致布局:
-    // - 旧版本: char name[128], phdr*, phnum, entry, base, size, ...
-    // - 新版本: 可能有变化
-    
-    // 尝试找到 base 字段（应该是一个有效的 ELF 基址）
-    for (size_t i = 0; i < sizeof(buf) - sizeof(uintptr_t); i += sizeof(uintptr_t)) {
-        uintptr_t value = *reinterpret_cast<uintptr_t*>(&buf[i]);
-        
-        // 检查是否是有效的 ELF 基址
-        if (value > 0x10000 && value < 0x800000000000ULL) {
-            // 验证是否是 ELF
-            uint8_t magic[4];
-            if (m_remote->readMemory(value, magic, 4) == 4) {
-                if (memcmp(magic, ELFMAG, SELFMAG) == 0) {
-                    m_offsets.base = i;
-                    LOGI("Found soinfo->base offset: 0x%x", m_offsets.base);
-                    break;
-                }
-            }
+
+    for (size_t off = 0; off + 8 <= code.size(); off += 4) {
+        uint32_t insn = *reinterpret_cast<uint32_t*>(code.data() + off);
+        if (insn == 0xD65F03C0) break;
+        if ((insn & 0x9F000000) != 0x90000000) continue; // ADRP
+        uintptr_t insnAddr = funcAddr + off;
+        uintptr_t page = decodeAdrpImmStatic(insn, insnAddr);
+        uint32_t insn2 = *reinterpret_cast<uint32_t*>(code.data() + off + 4);
+        if ((insn2 & 0xFFC00000) != 0xF9400000) continue; // LDR unsigned imm
+        int rd = insn & 0x1F;
+        int rn = (insn2 >> 5) & 0x1F;
+        int rt = insn2 & 0x1F;
+        if (rn != rd) continue;
+        int size = (insn2 >> 30) & 0x3;
+        uint32_t imm12 = (insn2 >> 10) & 0xFFF;
+        uintptr_t symAddr = page + ((uintptr_t)imm12 << size);
+        uintptr_t symVal = 0;
+        if (m_remote->readMemory(symAddr, &symVal, sizeof(symVal)) != sizeof(symVal)) continue;
+        if (rt == 0 && !m_solistAddr) {
+            m_solistAddr = symAddr;
+            LOGI("parseSolistGetHead mapped func@%p -> solist %p", (void*)funcAddr, (void*)symAddr);
+            return true;
         }
     }
-    
-    if (m_offsets.base == 0) {
-        LOGE("Cannot find soinfo->base offset");
+    return false;
+}
+
+bool SolistHider::parseSolistGetSomain(uintptr_t funcAddr) {
+    // Same logic as parseSolistGetHead
+    return parseSolistGetHead(funcAddr);
+}
+
+bool SolistHider::parseSolistAddSoinfo(uintptr_t funcAddr) {
+    const size_t READ_BYTES = 40;
+    std::vector<uint8_t> code(READ_BYTES);
+    if (m_remote->readMemory(funcAddr, code.data(), code.size()) != (ssize_t)code.size()) {
         return false;
     }
-    
-    // 查找 next 字段
-    // next 通常在 base 之后不远处，且指向另一个 soinfo
-    for (size_t i = m_offsets.base + sizeof(uintptr_t); i < sizeof(buf) - sizeof(uintptr_t); i += sizeof(uintptr_t)) {
-        uintptr_t value = *reinterpret_cast<uintptr_t*>(&buf[i]);
-        
-        if (value == 0) continue;
-        
-        // 检查是否指向另一个 soinfo（通过检查其 base 字段）
-        uintptr_t nextBase = 0;
-        if (m_remote->readMemory(value + m_offsets.base, &nextBase, sizeof(nextBase)) == sizeof(nextBase)) {
-            // 验证 nextBase 是否是有效的 ELF
-            uint8_t magic[4];
-            if (m_remote->readMemory(nextBase, magic, 4) == 4) {
-                if (memcmp(magic, ELFMAG, SELFMAG) == 0) {
-                    m_offsets.next = i;
-                    LOGI("Found soinfo->next offset: 0x%x", m_offsets.next);
-                    m_offsets.valid = true;
+
+    for (size_t off = 0; off + 8 <= code.size(); off += 4) {
+        uint32_t insn = *reinterpret_cast<uint32_t*>(code.data() + off);
+        if (insn == 0xD65F03C0) break;
+        if ((insn & 0x9F000000) != 0x90000000) continue; // ADRP
+        uintptr_t insnAddr = funcAddr + off;
+        uintptr_t page = decodeAdrpImmStatic(insn, insnAddr);
+        uint32_t insn2 = *reinterpret_cast<uint32_t*>(code.data() + off + 4);
+        if ((insn2 & 0xFFC00000) != 0xF9400000) continue; // LDR
+        int rd = insn & 0x1F;
+        int rn = (insn2 >> 5) & 0x1F;
+        int rt = insn2 & 0x1F;
+        if (rn != rd) continue;
+        int size = (insn2 >> 30) & 0x3;
+        uint32_t imm12 = (insn2 >> 10) & 0xFFF;
+        uintptr_t symAddr = page + ((uintptr_t)imm12 << size);
+        uintptr_t symVal = 0;
+        if (m_remote->readMemory(symAddr, &symVal, sizeof(symVal)) != sizeof(symVal)) continue;
+
+        // search forward for STR X0,[reg,#0x28]
+        for (size_t k = off + 8; k + 4 <= std::min(code.size(), off + 8 + 64); k += 4) {
+            uint32_t insn3 = *reinterpret_cast<uint32_t*>(code.data() + k);
+            if ((insn3 & 0xFFC00000) != 0xF9000000) continue; // STR
+            int rn3 = (insn3 >> 5) & 0x1F;
+            int rt3 = insn3 & 0x1F;
+            int size3 = (insn3 >> 30) & 0x3;
+            uint32_t imm123 = (insn3 >> 10) & 0xFFF;
+            uintptr_t off3 = ((uintptr_t)imm123 << size3);
+            if (rt3 == 0 && rn3 == rt && off3 == 0x28) {
+                if (!m_sonextAddr) {
+                    m_sonextAddr = symAddr;
+                    LOGI("parseSolistAddSoinfo mapped func@%p -> sonext %p", (void*)funcAddr, (void*)symAddr);
                     return true;
                 }
             }
         }
     }
-    
-    LOGE("Cannot find soinfo->next offset");
     return false;
 }
 
@@ -145,7 +285,7 @@ bool SolistHider::removeFromSolist(const ElfParser& elf) {
         return false;
     }
     
-    LOGI("solist head: %p", (void*)solist);
+    LOGI("solist head: %lx", solist);
     
     // 遍历链表查找目标 soinfo
     uintptr_t prev = 0;
@@ -153,24 +293,47 @@ bool SolistHider::removeFromSolist(const ElfParser& elf) {
     
     while (curr) {
         uintptr_t base = readSoinfoField<uintptr_t>(curr, m_offsets.base);
+        //LOGI(" soinfo base: %lx", base);
         
         if (base == elf.base()) {
             // 找到了
             LOGI("Found target soinfo: %p", (void*)curr);
             
-            // 获取 next
+            // 获取 next（处理可能的 pointer-to-pointer）
             uintptr_t next = readSoinfoField<uintptr_t>(curr, m_offsets.next);
+            if (m_nextIsIndirect) {
+                uintptr_t deref = 0;
+                if (m_remote->readMemory(next, &deref, sizeof(deref)) == sizeof(deref)) {
+                    next = deref;
+                } else {
+                    next = 0;
+                }
+            }
             
             if (prev == 0) {
                 // 是链表头，不能直接移除
                 LOGE("Target is solist head, cannot remove");
                 return false;
             }
-            
-            // 修改前一个节点的 next 指针
-            if (!writeSoinfoField(prev, m_offsets.next, next)) {
-                LOGE("Failed to update prev->next");
-                return false;
+
+            // 修改前一个节点的 next 指针（如果 next 字段是 indirect，则需要写入 *prev->next）
+            if (m_nextIsIndirect) {
+                // 读取 prev->next 字段（应为指向指针的位置）
+                uintptr_t prevField = readSoinfoField<uintptr_t>(prev, m_offsets.next);
+                if (prevField == 0) {
+                    LOGE("Prev field pointer is null");
+                    return false;
+                }
+                if (m_remote->writeMemory(prevField, &next, sizeof(next)) != sizeof(next)) {
+                    LOGE("Failed to update *prev->next (indirect)");
+                    return false;
+                }
+            } else {
+                // 直接写 prev->next
+                if (!writeSoinfoField(prev, m_offsets.next, next)) {
+                    LOGE("Failed to update prev->next");
+                    return false;
+                }
             }
             
             LOGI("Removed soinfo %p from solist", (void*)curr);
@@ -189,7 +352,18 @@ bool SolistHider::removeFromSolist(const ElfParser& elf) {
         }
         
         prev = curr;
-        curr = readSoinfoField<uintptr_t>(curr, m_offsets.next);
+        // 读取下一个节点，处理 indirect 情形
+        uintptr_t nextField = readSoinfoField<uintptr_t>(curr, m_offsets.next);
+        if (m_nextIsIndirect) {
+            uintptr_t nextNode = 0;
+            if (nextField && m_remote->readMemory(nextField, &nextNode, sizeof(nextNode)) == sizeof(nextNode)) {
+                curr = nextNode;
+            } else {
+                curr = 0;
+            }
+        } else {
+            curr = nextField;
+        }
     }
     
     LOGE("Target ELF not found in solist");

@@ -52,7 +52,46 @@ bool ElfParser::loadFromFile(const std::string& path) {
     }
     
     m_entry = m_header.e_entry;
-    m_valid = parseHeader();
+    m_valid = parseHeader() && parseDynamic();
+    // 解析文件中的 section 符号表（如果有）
+    if (m_valid) {
+        // 解析 section header 中的 .symtab/.strtab
+        if (!m_localData.empty()) {
+            // parse section headers
+            if (m_header.e_shoff && m_header.e_shnum) {
+                size_t shentsize = sizeof(Elf_Shdr);
+                size_t shTableSize = (size_t)m_header.e_shnum * shentsize;
+                if (m_header.e_shoff + shTableSize <= m_localData.size()) {
+                    // section header string table
+                    uint32_t shstrIndex = m_header.e_shstrndx;
+                    if (shstrIndex < m_header.e_shnum) {
+                        const Elf_Shdr* shTable = reinterpret_cast<const Elf_Shdr*>(m_localData.data() + m_header.e_shoff);
+                        const Elf_Shdr& shstr = shTable[shstrIndex];
+                        if (shstr.sh_offset + shstr.sh_size <= m_localData.size()) {
+                            for (uint16_t i = 0; i < m_header.e_shnum; ++i) {
+                                const Elf_Shdr& sh = shTable[i];
+                                if (sh.sh_type == SHT_SYMTAB) {
+                                    // 找到符号表，读取它和对应的字符串表（sh_link）
+                                    if (sh.sh_offset + sh.sh_size <= m_localData.size() && sh.sh_entsize >= sizeof(Elf_Sym) && sh.sh_entsize != 0) {
+                                        uint32_t count = (uint32_t)(sh.sh_size / sh.sh_entsize);
+                                        uint32_t strIndex = sh.sh_link;
+                                        if (strIndex < m_header.e_shnum) {
+                                            const Elf_Shdr& strSh = shTable[strIndex];
+                                            if (strSh.sh_offset + strSh.sh_size <= m_localData.size()) {
+                                                m_localSymtabOffset = (uintptr_t)sh.sh_offset;
+                                                m_localSymCount = count;
+                                                m_localStrtabOffset = (uintptr_t)strSh.sh_offset;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     return m_valid;
 }
 
@@ -129,7 +168,12 @@ bool ElfParser::parseHeader() {
             m_segments.push_back(seg);
         }
         else if (phdr.p_type == PT_DYNAMIC) {
-            m_dynamicAddr = m_base + phdr.p_vaddr;
+            // 如果是远程解析，dynamic 地址为运行时地址；如果是本地文件解析，则记录为文件偏移
+            if (m_remotePid > 0) {
+                m_dynamicAddr = m_base + phdr.p_vaddr;
+            } else {
+                m_dynamicAddr = phdr.p_offset;
+            }
         }
     }
     
@@ -139,6 +183,8 @@ bool ElfParser::parseHeader() {
 
 bool ElfParser::parseDynamic() {
     if (!m_dynamicAddr) return true;
+    // 如果是本地文件加载（m_remotePid == 0），我们不从远程进程读取 dynamic 表（已通过 section 解析本地符号）
+    if (m_remotePid == 0) return true;
     
     // 读取动态段
     std::vector<Elf_Dyn> dyns;
@@ -197,6 +243,50 @@ bool ElfParser::parseDynamic() {
     
     return true;
 }
+
+// 设置基址
+void ElfParser::setBase(uintptr_t base) {
+    if (m_base == base) return;
+    m_base = base;
+
+    // 如果已经解析过 program headers，则重建 segments、dynamic 地址和 loadSize
+    if (!m_phdrs.empty()) {
+        m_segments.clear();
+        uintptr_t minAddr = UINTPTR_MAX;
+        uintptr_t maxAddr = 0;
+
+        for (const auto& phdr : m_phdrs) {
+            if (phdr.p_type == PT_LOAD) {
+                MapEntry seg;
+                seg.start = m_base + phdr.p_vaddr;
+                seg.end = seg.start + phdr.p_memsz;
+                seg.prot = 0;
+                if (phdr.p_flags & PF_R) seg.prot |= 0x1;
+                if (phdr.p_flags & PF_W) seg.prot |= 0x2;
+                if (phdr.p_flags & PF_X) seg.prot |= 0x4;
+                seg.offset = phdr.p_offset;
+                m_segments.push_back(seg);
+
+                if (phdr.p_vaddr < minAddr) minAddr = phdr.p_vaddr;
+                if (phdr.p_vaddr + phdr.p_memsz > maxAddr) maxAddr = phdr.p_vaddr + phdr.p_memsz;
+            } else if (phdr.p_type == PT_DYNAMIC) {
+                if (m_remotePid > 0) {
+                    m_dynamicAddr = m_base + phdr.p_vaddr;
+                } else {
+                    m_dynamicAddr = phdr.p_offset;
+                }
+            }
+        }
+
+        if (minAddr != UINTPTR_MAX && maxAddr > minAddr) {
+            m_loadSize = maxAddr - minAddr;
+        }
+    }
+
+    // 更新入口点为运行时地址
+    m_entry = m_base + m_header.e_entry;
+}
+
 
 bool ElfParser::parseGnuHash() {
     if (!m_gnuHash || m_remotePid <= 0) return false;
@@ -414,6 +504,23 @@ uintptr_t ElfParser::findSymbol(const std::string& name) const {
         addr = findSymbolLinear(name);
     }
     
+    // 如果动态表/散列未命中，尝试在本地文件的 .symtab 中查找（用于 local 符号）
+    if (!addr && !m_localData.empty() && m_localSymtabOffset && m_localStrtabOffset && m_localSymCount > 0) {
+        for (size_t i = 0; i < m_localSymCount; ++i) {
+            size_t off = m_localSymtabOffset + i * sizeof(Elf_Sym);
+            if (off + sizeof(Elf_Sym) > m_localData.size()) break;
+            const Elf_Sym* sym = reinterpret_cast<const Elf_Sym*>(m_localData.data() + off);
+            if (sym->st_name == 0) continue;
+            size_t nameOff = m_localStrtabOffset + sym->st_name;
+            if (nameOff >= m_localData.size()) continue;
+            const char* symName = reinterpret_cast<const char*>(m_localData.data() + nameOff);
+            if (name == symName && sym->st_value != 0) {
+                addr = m_base + sym->st_value;
+                break;
+            }
+        }
+    }
+
     if (addr) {
         m_symbolCache[name] = addr;
     }

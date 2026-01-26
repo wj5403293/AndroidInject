@@ -26,6 +26,11 @@ private:
     // 查找 linker 中的 solist/sonext 地址
     bool findLinkerSymbols();
     
+    // per-function ADRP parsers
+    bool parseSolistAddSoinfo(uintptr_t funcAddr);
+    bool parseSolistGetHead(uintptr_t funcAddr);
+    bool parseSolistGetSomain(uintptr_t funcAddr);
+
     // 动态查找 soinfo 结构偏移
     bool findSoinfoOffsets(uintptr_t soinfo);
     
@@ -43,4 +48,6 @@ private:
     uintptr_t m_solistAddr = 0;   // &solist
     uintptr_t m_sonextAddr = 0;   // &sonext
     SoinfoOffsets m_offsets;
+    // 如果 next 字段是指向指针（pointer-to-pointer），此标志为 true
+    bool m_nextIsIndirect = false;
 };
