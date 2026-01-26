@@ -275,7 +275,10 @@ bool SolistHider::removeFromSolist(const ElfParser& elf) {
         LOGE("SolistHider not properly initialized");
         return false;
     }
-    
+
+    LOGI("Resetting g_module_load_counter...");
+    solist_reset_counters(elf);
+
     LOGI("Removing ELF %p from solist...", (void*)elf.base());
     
     // 读取 solist 头
@@ -368,4 +371,36 @@ bool SolistHider::removeFromSolist(const ElfParser& elf) {
     
     LOGE("Target ELF not found in solist");
     return false;
+}
+
+bool SolistHider::solist_reset_counters(const ElfParser &elf) {
+    (void)elf;
+    uintptr_t g_module_load_counter = m_linkerElf.findSymbol("__dl__ZL21g_module_load_counter");
+    if (!g_module_load_counter) {
+        LOGW("g_module_load_counter symbol not found");
+        return false;
+    }
+
+    uint64_t counter = 0;
+    ssize_t rr = m_remote->readMemory(g_module_load_counter, &counter, sizeof(counter));
+    if (rr != (ssize_t)sizeof(counter)) {
+        LOGE("Failed to read g_module_load_counter at %p", (void*)g_module_load_counter);
+        return false;
+    }
+
+    LOGI("g_module_load_counter: address 0x%lx, value 0x%lx", (unsigned long)g_module_load_counter, (unsigned long)counter);
+    if (counter == 0) {
+        LOGI("g_module_load_counter already zero, nothing to do");
+        return true;
+    }
+
+    counter--;
+    ssize_t wr = m_remote->writeMemory(g_module_load_counter, &counter, sizeof(counter));
+    if (wr != (ssize_t)sizeof(counter)) {
+        LOGE("Failed to write g_module_load_counter at %p", (void*)g_module_load_counter);
+        return false;
+    }
+
+    LOGI("reset g_module_load_counter to 0x%lx", (unsigned long)counter);
+    return true;
 }

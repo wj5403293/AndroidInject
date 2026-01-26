@@ -21,7 +21,9 @@ public:
     
     // 从 linker solist 中移除 ELF
     bool removeFromSolist(const ElfParser& elf);
-    
+
+    // reset g_module_load_counter
+    bool solist_reset_counters(const ElfParser& elf);
 private:
     // 查找 linker 中的 solist/sonext 地址
     bool findLinkerSymbols();
