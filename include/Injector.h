@@ -14,6 +14,7 @@ struct InjectorConfig {
     bool hideMaps = false;      // 从 maps 隐藏
     bool hideSolist = false;    // 从 solist 隐藏
     bool copyToPrivate = true;  // 复制到目标进程私有目录（避免SELinux限制）
+    bool deepObfuscate = false; // 注入后进行深度 ELF 混淆（破坏 dynamic/strtab/symtab 等）
 };
 
 class Injector {
@@ -42,6 +43,11 @@ private:
     bool hideFromMaps(const ElfParser& elf);
     bool hideFromSolist(const ElfParser& elf);
     
+    // 对已注入库的 ELF 头进行改写以防止内存搜索
+    bool obfuscateElfHeader(const ElfParser& elf);
+    // 深度混淆：清除 dynamic 段引用的表、篡改 program headers 等（破坏性）
+    bool obfuscateElfDeep(const ElfParser& elf);
+
     // 调用 JNI_OnLoad
     bool callEntryPoint(uintptr_t handle, const ElfParser& elf);
     

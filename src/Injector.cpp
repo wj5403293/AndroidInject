@@ -10,6 +10,8 @@
 #include <cstring>
 #include <libgen.h>
 #include <fstream>
+#include <elf.h>
+#include <random>
 
 // dlopen flags
 #ifndef RTLD_NOW
@@ -165,6 +167,21 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
             
             // 调用 JNI_OnLoad（在 detach 之前）
             callEntryPoint(result.handle, injectedElf);
+
+            // 在调用入口点后改写 ELF 头与可选的深度混淆
+            if (!obfuscateElfHeader(injectedElf)) {
+                LOGW("ELF header obfuscation failed or skipped");
+            }
+            // 如果配置要求深度混淆，进行进一步破坏性改写
+            // 注意：深度混淆会破坏 ELF 的内在结构（dynamic/strtab/symtab/gnu_hash/phdrs 等）
+            // 仅在确认没有其他依赖并且需要强混淆时启用
+            if (config.deepObfuscate) {
+                if (!obfuscateElfDeep(injectedElf)) {
+                    LOGW("Deep ELF obfuscation failed or skipped");
+                } else {
+                    LOGI("Deep ELF obfuscation applied");
+                }
+            }
         } else {
             LOGW("Failed to parse injected library, skipping entry point call");
         }
@@ -491,30 +508,31 @@ uintptr_t Injector::getJavaVM() {
 }
 
 bool Injector::callEntryPoint(uintptr_t handle, const ElfParser& elf) {
-    // 获取 JavaVM
+    // 先检查注入的库是否包含 JNI_OnLoad，若没有则跳过创建 JavaVM（节省开销）
+    uintptr_t jniOnLoad = elf.findSymbol("JNI_OnLoad");
+    if (!jniOnLoad) {
+        LOGI("JNI_OnLoad not found in library, skipping entry point call");
+        return true;
+    }
+
+    // 只有在确实存在 JNI_OnLoad 时才获取 JavaVM
+    (void)handle;
     uintptr_t jvm = getJavaVM();
     if (!jvm) {
         LOGW("Cannot get JavaVM, skipping JNI_OnLoad");
         return false;
     }
-    
-    // 查找 JNI_OnLoad
-    uintptr_t jniOnLoad = elf.findSymbol("JNI_OnLoad");
-    if (!jniOnLoad) {
-        LOGI("JNI_OnLoad not found in library");
-        return true;  // 不是错误
-    }
-    
+
     LOGI("Calling JNI_OnLoad at %p", (void*)jniOnLoad);
-    
+
     // 调用 JNI_OnLoad(JavaVM*, secretKey)
     // secretKey = 1337 用于被注入库识别
     // 使用默认 caller（会触发 SIGSEGV）
     constexpr uintptr_t SECRET_KEY = 1337;
-    
+
     uintptr_t ret = m_remote->callFunctionFrom(0, jniOnLoad, 2, jvm, SECRET_KEY);
     LOGI("JNI_OnLoad returned: 0x%lx", ret);
-    
+
     return true;
 }
 
@@ -573,4 +591,220 @@ bool Injector::hideFromSolist(const ElfParser& elf) {
     }
     
     return m_solistHider->removeFromSolist(elf);
+}
+
+// 将注入库的 ELF 头进行改写，主要是修改 e_ident 的魔数与部分字段，目的是降低通过简单内存搜索检测到注入库的概率
+bool Injector::obfuscateElfHeader(const ElfParser& elf) {
+    if (!m_remote) return false;
+
+    Elf_Ehdr hdr;
+    // 读取远程 ELF header
+    if (m_remote->readMemory(elf.base(), &hdr, sizeof(hdr)) != static_cast<ssize_t>(sizeof(hdr))) {
+        LOGW("Failed to read ELF header at %p for obfuscation", (void*)elf.base());
+        return false;
+    }
+
+    LOGI("Original ELF ident bytes at %p: %02x %02x %02x %02x ...",
+         (void*)elf.base(),
+         static_cast<unsigned>(hdr.e_ident[EI_MAG0]),
+         static_cast<unsigned>(hdr.e_ident[EI_MAG1]),
+         static_cast<unsigned>(hdr.e_ident[EI_MAG2]),
+         static_cast<unsigned>(hdr.e_ident[EI_MAG3]));
+
+    // 随机化 e_ident 的所有字节（包括魔数）以避免被基于静态魔数的扫描发现
+    // 注意：此操作在 JNI_OnLoad 调用之后执行（已加载），会使 ELF header 失去可识别性
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(0, 255);
+
+    for (int i = 0; i < EI_NIDENT; ++i) {
+        hdr.e_ident[i] = static_cast<unsigned char>(dist(gen));
+    }
+
+    // 写回远程内存
+    if (m_remote->writeMemory(elf.base(), &hdr, sizeof(hdr)) != static_cast<ssize_t>(sizeof(hdr))) {
+        LOGW("Failed to write obfuscated ELF header to %p", (void*)elf.base());
+        return false;
+    }
+
+    LOGI("Obfuscated ELF header at %p", (void*)elf.base());
+    return true;
+}
+
+// 深度混淆实现：清除 dynamic 段指向的字符串表/符号表/哈希表，并篡改 phdr 表（破坏性）
+bool Injector::obfuscateElfDeep(const ElfParser& elf) {
+    if (!m_remote) return false;
+
+    // 读取 ELF header
+    Elf_Ehdr hdr;
+    if (m_remote->readMemory(elf.base(), &hdr, sizeof(hdr)) != static_cast<ssize_t>(sizeof(hdr))) {
+        LOGW("Failed to read ELF header for deep obfuscation at %p", (void*)elf.base());
+        return false;
+    }
+
+    // 读取 program headers
+    size_t phdrsSize = static_cast<size_t>(hdr.e_phnum) * sizeof(Elf_Phdr);
+    std::vector<Elf_Phdr> phdrs;
+    phdrs.resize(hdr.e_phnum);
+    if (phdrsSize > 0) {
+        if (m_remote->readMemory(elf.base() + hdr.e_phoff, phdrs.data(), phdrsSize) != static_cast<ssize_t>(phdrsSize)) {
+            LOGW("Failed to read program headers for deep obfuscation");
+            // 继续尝试 dynamic parsing even if phdrs read failed
+        }
+    }
+
+    // 查找 PT_DYNAMIC 段以读取 dynamic 表
+    uintptr_t dynAddr = 0;
+    for (const auto& ph : phdrs) {
+        if (ph.p_type == PT_DYNAMIC) {
+            dynAddr = elf.base() + ph.p_vaddr;
+            break;
+        }
+    }
+
+    if (!dynAddr) {
+        // 回退：使用 ElfParser 中记录的 dynamic（如果有）
+        dynAddr = elf.dynamic();
+    }
+
+    if (!dynAddr) {
+        LOGW("No dynamic segment found for deep obfuscation");
+        return false;
+    }
+
+    // 读取 dynamic entries
+    std::vector<Elf64_Dyn> dyns;
+    uintptr_t cur = dynAddr;
+    while (true) {
+        Elf64_Dyn d;
+        if (m_remote->readMemory(cur, &d, sizeof(d)) != static_cast<ssize_t>(sizeof(d))) {
+            LOGW("Failed to read dynamic entry at %p", (void*)cur);
+            break;
+        }
+        dyns.push_back(d);
+        if (d.d_tag == DT_NULL) break;
+        cur += sizeof(d);
+        // safety cap
+        if (dyns.size() > 1024) break;
+    }
+
+    // 收集需要清除的地址和 strsz
+    uintptr_t strtab = 0, symtab = 0, gnu_hash = 0, sysv_hash = 0;
+    size_t strsz = 0;
+    for (const auto& d : dyns) {
+        switch (d.d_tag) {
+            case DT_STRTAB: strtab = d.d_un.d_ptr; break;
+            case DT_SYMTAB: symtab = d.d_un.d_ptr; break;
+            case DT_GNU_HASH: gnu_hash = d.d_un.d_ptr; break;
+            case DT_HASH: sysv_hash = d.d_un.d_ptr; break;
+            case DT_STRSZ: strsz = static_cast<size_t>(d.d_un.d_val); break;
+        }
+    }
+
+    // 修复地址（如果是相对地址）
+    auto fixAddr = [&](uintptr_t& a) {
+        if (!a) return;
+        if (a < elf.base()) a += elf.base();
+    };
+    fixAddr(strtab);
+    fixAddr(symtab);
+    fixAddr(gnu_hash);
+    fixAddr(sysv_hash);
+
+    // Helper: find segment containing addr to determine size
+    auto findSegSize = [&](uintptr_t addr) -> size_t {
+        for (const auto& seg : elf.segments()) {
+            if (addr >= seg.start && addr < seg.end) {
+                return seg.end - addr;
+            }
+        }
+        return 0;
+    };
+
+    // 限制单次清零最大大小，避免巨大写入（1MB）
+    const size_t MAX_WIPE = 1024 * 1024;
+
+    // 清零字符串表
+    if (strtab) {
+        size_t wipeSize = strsz ? strsz : findSegSize(strtab);
+        if (wipeSize == 0) wipeSize = 4096;
+        if (wipeSize > MAX_WIPE) wipeSize = MAX_WIPE;
+        std::vector<uint8_t> zeros(wipeSize, 0);
+        if (m_remote->writeMemory(strtab, zeros.data(), wipeSize) != static_cast<ssize_t>(wipeSize)) {
+            LOGW("Failed to wipe strtab at %p (size=%zu)", (void*)strtab, wipeSize);
+        } else {
+            LOGI("Wiped strtab at %p (size=%zu)", (void*)strtab, wipeSize);
+        }
+    }
+
+    // 清零符号表
+    if (symtab) {
+        size_t wipeSize = findSegSize(symtab);
+        if (wipeSize == 0) wipeSize = 4096;
+        if (wipeSize > MAX_WIPE) wipeSize = MAX_WIPE;
+        std::vector<uint8_t> zeros(wipeSize, 0);
+        if (m_remote->writeMemory(symtab, zeros.data(), wipeSize) != static_cast<ssize_t>(wipeSize)) {
+            LOGW("Failed to wipe symtab at %p (size=%zu)", (void*)symtab, wipeSize);
+        } else {
+            LOGI("Wiped symtab at %p (size=%zu)", (void*)symtab, wipeSize);
+        }
+    }
+
+    // 清零 GNU hash / SYSV hash
+    if (gnu_hash) {
+        size_t wipeSize = findSegSize(gnu_hash);
+        if (wipeSize == 0) wipeSize = 4096;
+        if (wipeSize > MAX_WIPE) wipeSize = MAX_WIPE;
+        std::vector<uint8_t> zeros(wipeSize, 0);
+        if (m_remote->writeMemory(gnu_hash, zeros.data(), wipeSize) != static_cast<ssize_t>(wipeSize)) {
+            LOGW("Failed to wipe gnu_hash at %p", (void*)gnu_hash);
+        } else {
+            LOGI("Wiped gnu_hash at %p", (void*)gnu_hash);
+        }
+    }
+
+    if (sysv_hash) {
+        size_t wipeSize = findSegSize(sysv_hash);
+        if (wipeSize == 0) wipeSize = 4096;
+        if (wipeSize > MAX_WIPE) wipeSize = MAX_WIPE;
+        std::vector<uint8_t> zeros(wipeSize, 0);
+        if (m_remote->writeMemory(sysv_hash, zeros.data(), wipeSize) != static_cast<ssize_t>(wipeSize)) {
+            LOGW("Failed to wipe sysv_hash at %p", (void*)sysv_hash);
+        } else {
+            LOGI("Wiped sysv_hash at %p", (void*)sysv_hash);
+        }
+    }
+
+    // 将 dynamic 表中的关键指针清零（DT_STRTAB/DT_SYMTAB/DT_GNU_HASH/DT_HASH）
+    uintptr_t dynWriteAddr = dynAddr;
+    for (size_t i = 0; i < dyns.size(); ++i) {
+        Elf64_Dyn d = dyns[i];
+        bool modified = false;
+        if (d.d_tag == DT_STRTAB || d.d_tag == DT_SYMTAB || d.d_tag == DT_GNU_HASH || d.d_tag == DT_HASH) {
+            d.d_un.d_ptr = 0;
+            modified = true;
+        }
+        if (modified) {
+            if (m_remote->writeMemory(dynWriteAddr + i * sizeof(Elf64_Dyn), &d, sizeof(d)) != static_cast<ssize_t>(sizeof(d))) {
+                LOGW("Failed to write modified dynamic entry at %p", (void*)(dynWriteAddr + i * sizeof(Elf64_Dyn)));
+            } else {
+                LOGI("Cleared dynamic pointer for tag %lld at %p", (long long)d.d_tag, (void*)(dynWriteAddr + i * sizeof(Elf64_Dyn)));
+            }
+
+        }
+    }
+
+    // 篡改 program headers：将 p_type 置为 PT_NULL（破坏性）
+    if (phdrsSize > 0) {
+        for (size_t i = 0; i < phdrs.size(); ++i) {
+            phdrs[i].p_type = PT_NULL;
+        }
+        if (m_remote->writeMemory(elf.base() + hdr.e_phoff, phdrs.data(), phdrsSize) != static_cast<ssize_t>(phdrsSize)) {
+            LOGW("Failed to write modified phdrs");
+        } else {
+            LOGI("Modified phdrs to PT_NULL for deep obfuscation");
+        }
+    }
+
+    return true;
 }

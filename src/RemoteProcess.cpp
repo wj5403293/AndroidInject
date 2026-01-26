@@ -526,7 +526,7 @@ uintptr_t RemoteProcess::findDefaultCaller() {
     // 参考原项目，使用 libRS.so 的基地址作为默认 caller
     // 如果找不到 libRS.so，尝试其他库
     const char* candidates[] = {
-        "libRS.so",
+        // "libRS.so",
         "libc.so",
         "libdl.so",
         nullptr
