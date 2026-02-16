@@ -1,12 +1,13 @@
 #include "Utils.h"
 #include <fstream>
-#include <sstream>
 #include <cstdarg>
 #include <cstring>
 #include <dirent.h>
 #include <unistd.h>
 #include <random>
-#include <chrono>
+ 
+#include <link.h>
+#include <dlfcn.h>
 
 namespace Utils {
 
@@ -95,30 +96,90 @@ std::vector<MapEntry> parseMaps(pid_t pid) {
 }
 
 MapEntry findMapByName(pid_t pid, const std::string& name) {
-    auto maps = parseMaps(pid);
-    
-    // 优先查找 offset=0 的段（ELF header 所在位置）
-    for (const auto& map : maps) {
-        if (map.path.find(name) != std::string::npos && map.offset == 0) {
-            return map;
-        }
+    // 尝试多次读取 maps，以防 dlopen 后映射尚未立即出现在 /proc/[pid]/maps
+    const int maxAttempts = 25;
+    const useconds_t sleepUs = 10000; // 10ms
+    // 提取 basename 以便匹配路径中可能只包含文件名的情况
+    std::string baseName;
+    size_t pos = name.find_last_of('/');
+    if (pos != std::string::npos && pos + 1 < name.size()) {
+        baseName = name.substr(pos + 1);
     }
-    
-    // 如果没有 offset=0 的段，返回第一个可读段
-    for (const auto& map : maps) {
-        if (map.path.find(name) != std::string::npos && map.isReadable()) {
-            return map;
+
+    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        auto maps = parseMaps(pid);
+
+        // 优先查找 offset=0 的段（ELF header 所在位置）
+        for (const auto& map : maps) {
+            if ((map.path.find(name) != std::string::npos || (!baseName.empty() && map.path.find(baseName) != std::string::npos))
+                 && map.offset == 0) {
+                return map;
+            }
         }
-    }
-    
-    // 最后返回第一个匹配的
-    for (const auto& map : maps) {
-        if (map.path.find(name) != std::string::npos) {
-            return map;
+
+        // 如果没有 offset=0 的段，返回第一个可读段
+        for (const auto& map : maps) {
+            if ((map.path.find(name) != std::string::npos || (!baseName.empty() && map.path.find(baseName) != std::string::npos))
+                 && map.isReadable()) {
+                return map;
+            }
         }
+
+        // 最后返回第一个匹配的
+        for (const auto& map : maps) {
+            if (map.path.find(name) != std::string::npos || (!baseName.empty() && map.path.find(baseName) != std::string::npos)) {
+                return map;
+            }
+        }
+
+        // 等待短暂时间再重试
+        usleep(sleepUs);
     }
-    
+
     return {};
+}
+
+// 使用 dl_iterate_phdr 解析当前进程已加载的 so 映射（仅限当前进程）
+static int dl_phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
+    (void)size;
+    if (!info || !data) return 0;
+    auto maps = static_cast<std::vector<MapEntry>*>(data);
+
+    std::string path = info->dlpi_name ? info->dlpi_name : "";
+    // if (path.empty()) {
+    //     // 对于主程序，dlpi_name 可能为空，尝试使用 /proc/self/exe
+    //     char exePath[512] = {0};
+    //     ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    //     if (len > 0) {
+    //         exePath[len] = '\0';
+    //         path = exePath;
+    //     }
+    // }
+
+    for (int i = 0; i < static_cast<int>(info->dlpi_phnum); ++i) {
+        const Elf_Phdr& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD) continue;
+
+        MapEntry entry{};
+        entry.start = static_cast<uintptr_t>(info->dlpi_addr + ph.p_vaddr);
+        entry.end = entry.start + ph.p_memsz;
+        entry.offset = static_cast<size_t>(ph.p_offset);
+        entry.prot = 0;
+        if (ph.p_flags & PF_R) entry.prot |= 0x1;
+        if (ph.p_flags & PF_W) entry.prot |= 0x2;
+        if (ph.p_flags & PF_X) entry.prot |= 0x4;
+        entry.path = path;
+
+        maps->push_back(entry);
+    }
+
+    return 0;
+}
+
+std::vector<MapEntry> parseMapsWithDl() {
+    std::vector<MapEntry> maps;
+    dl_iterate_phdr(dl_phdr_callback, &maps);
+    return maps;
 }
 
 std::string format(const char* fmt, ...) {

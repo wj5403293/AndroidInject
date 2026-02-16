@@ -61,12 +61,17 @@ public:
     
     pid_t pid() const { return m_pid; }
 
+    // 冻结/解冻目标进程的所有线程（ptrace attach/detach 除主线程外的所有 TID）
+    bool freezeAllThreads();
+    bool thawAllThreads();
+
 private:
     uintptr_t findSyscallGadget();
     uintptr_t findDefaultCaller();
-    
+
     pid_t m_pid;
     bool m_attached = false;
     uintptr_t m_syscallAddr = 0;
     uintptr_t m_defaultCaller = 0;
+    std::vector<pid_t> m_frozenTids;
 };

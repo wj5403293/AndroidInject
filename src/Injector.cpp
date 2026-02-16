@@ -60,8 +60,8 @@ bool Injector::init() {
 }
 
 void Injector::cleanupAllocations() {
-    if (!m_remote) return;
-    
+    if (!m_remote || m_allocations.empty()) return;
+    LOGI("cleanupAllocations");
     for (const auto& alloc : m_allocations) {
         m_remote->remoteFree(alloc.first, alloc.second);
     }
@@ -84,28 +84,15 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
         return result;
     }
     
-    // 设置默认 caller（参考原项目使用 libRS.so 的基地址）
-    // 需要找一个有效但不可执行的地址，函数返回后跳转到该地址会触发 SIGSEGV
+    // 使用 libc.so 只读段（offset=0）作为默认 caller
+    // 函数返回后跳转到该地址会触发 SIGSEGV，用于捕获远程调用完成
     auto maps = Utils::parseMaps(m_pid);
     uintptr_t defaultCaller = 0;
-    
-    // 优先查找 libRS.so
     for (const auto& map : maps) {
-        if (map.path.find("libRS.so") != std::string::npos && map.offset == 0) {
+        if (map.path.find("libc.so") != std::string::npos && map.offset == 0) {
             defaultCaller = map.start;
-            LOGI("Default caller (libRS.so): %p", (void*)defaultCaller);
+            LOGI("Default caller (libc.so): %p", (void*)defaultCaller);
             break;
-        }
-    }
-    
-    // 如果没有 libRS.so，使用 libc.so 的只读段（offset=0）
-    if (!defaultCaller) {
-        for (const auto& map : maps) {
-            if (map.path.find("libc.so") != std::string::npos && map.offset == 0) {
-                defaultCaller = map.start;
-                LOGI("Default caller (libc.so): %p", (void*)defaultCaller);
-                break;
-            }
         }
     }
     
@@ -157,14 +144,16 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
         // 获取加载后的 ELF 信息
         ElfParser injectedElf;
         if (injectedElf.loadFromMemory(m_pid, result.base)) {
-            // 隐藏处理
-            if (config.hideMaps) {
-                hideFromMaps(injectedElf);
-            }
+
             if (config.hideSolist) {
                 hideFromSolist(injectedElf);
             }
             
+            // 隐藏处理
+            if (config.hideMaps) {
+                hideFromMaps(injectedElf);
+            }
+ 
             // 调用 JNI_OnLoad（在 detach 之前）
             callEntryPoint(result.handle, injectedElf);
 
@@ -538,19 +527,23 @@ bool Injector::callEntryPoint(uintptr_t handle, const ElfParser& elf) {
 
 bool Injector::hideFromMaps(const ElfParser& elf) {
     LOGI("Hiding library from maps...");
-    
+
+    // 冻结所有线程，防止注入库启动的线程在映射替换期间执行代码页导致崩溃
+    m_remote->freezeAllThreads();
+
     auto maps = Utils::parseMaps(m_pid);
-    
+    bool success = true;
+
     for (const auto& map : maps) {
         // 查找属于注入库的映射
         if (map.start < elf.base() || map.start >= elf.base() + elf.loadSize()) {
             continue;
         }
-        
+
         if (map.path.empty()) continue;
-        
+
         LOGI("Hiding segment: %lx-%lx", map.start, map.end);
-        
+
         // 备份内容
         size_t size = map.size();
         std::vector<uint8_t> backup(size);
@@ -558,25 +551,26 @@ bool Injector::hideFromMaps(const ElfParser& elf) {
             LOGE("Failed to backup segment");
             continue;
         }
-        
-        // 解除映射
-        m_remote->syscall(Syscall::MUNMAP, map.start, size, 0, 0, 0, 0);
-        
-        // 重新映射为匿名内存（使用 MAP_FIXED）
+
+        // 直接用 MAP_FIXED 覆盖为匿名映射（原子替换，不需要先 munmap）
         int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-        uintptr_t newAddr = m_remote->syscall(Syscall::MMAP, map.start, size, 
+        uintptr_t newAddr = m_remote->syscall(Syscall::MMAP, map.start, size,
                                               (uintptr_t)map.prot, (uintptr_t)flags, 0, 0);
-        
+
         if (newAddr != map.start) {
             LOGE("Failed to remap segment at original address: got %p", (void*)newAddr);
-            return false;
+            success = false;
+            break;
         }
-        
+
         // 恢复内容
         m_remote->writeMemory(map.start, backup.data(), size);
     }
-    
-    return true;
+
+    // 解冻所有线程
+    m_remote->thawAllThreads();
+
+    return success;
 }
 
 bool Injector::hideFromSolist(const ElfParser& elf) {
@@ -615,7 +609,7 @@ bool Injector::obfuscateElfHeader(const ElfParser& elf) {
     // 注意：此操作在 JNI_OnLoad 调用之后执行（已加载），会使 ELF header 失去可识别性
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> dist(0, 255);
+    std::uniform_int_distribution<int> dist(125, 200);
 
     for (int i = 0; i < EI_NIDENT; ++i) {
         hdr.e_ident[i] = static_cast<unsigned char>(dist(gen));

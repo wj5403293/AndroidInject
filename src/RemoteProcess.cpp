@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstdarg>
+#include <dirent.h>
 
 // 验证返回指针是否有效（参考原项目）
 #define IsValidRetPtr(x) (uintptr_t(x) > 0 && uintptr_t(x) != uintptr_t(-1) && \
@@ -522,11 +523,8 @@ uintptr_t RemoteProcess::findRemoteSymbol(const char* localSymName, uintptr_t lo
 
 uintptr_t RemoteProcess::findDefaultCaller() {
     if (m_defaultCaller) return m_defaultCaller;
-    
-    // 参考原项目，使用 libRS.so 的基地址作为默认 caller
-    // 如果找不到 libRS.so，尝试其他库
+
     const char* candidates[] = {
-        // "libRS.so",
         "libc.so",
         "libdl.so",
         nullptr
@@ -543,4 +541,54 @@ uintptr_t RemoteProcess::findDefaultCaller() {
     
     LOGW("Cannot find default caller library");
     return 0;
+}
+
+bool RemoteProcess::freezeAllThreads() {
+    m_frozenTids.clear();
+
+    char taskPath[64];
+    snprintf(taskPath, sizeof(taskPath), "/proc/%d/task", m_pid);
+
+    DIR* dir = opendir(taskPath);
+    if (!dir) {
+        LOGE("Failed to open %s: %s", taskPath, strerror(errno));
+        return false;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        pid_t tid = atoi(entry->d_name);
+        if (tid <= 0 || tid == m_pid) continue;
+
+        errno = 0;
+        if (ptrace(PTRACE_ATTACH, tid, nullptr, nullptr) == -1L) {
+            LOGW("Failed to attach to tid %d: %s", tid, strerror(errno));
+            continue;
+        }
+
+        int status;
+        if (waitpid(tid, &status, __WALL) == tid && WIFSTOPPED(status)) {
+            m_frozenTids.push_back(tid);
+        } else {
+            LOGW("waitpid failed for tid %d, detaching", tid);
+            ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
+        }
+    }
+
+    closedir(dir);
+    LOGI("Frozen %zu extra threads", m_frozenTids.size());
+    return true;
+}
+
+bool RemoteProcess::thawAllThreads() {
+    for (pid_t tid : m_frozenTids) {
+        if (ptrace(PTRACE_DETACH, tid, nullptr, nullptr) == -1L) {
+            LOGW("Failed to detach from tid %d: %s", tid, strerror(errno));
+        }
+    }
+    LOGI("Thawed %zu extra threads", m_frozenTids.size());
+    m_frozenTids.clear();
+    return true;
 }
