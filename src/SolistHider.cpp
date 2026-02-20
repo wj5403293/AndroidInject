@@ -214,47 +214,33 @@ bool SolistHider::parseSolistGetSomain(uintptr_t funcAddr) {
 }
 
 bool SolistHider::parseSolistAddSoinfo(uintptr_t funcAddr) {
-    const size_t READ_BYTES = 40;
-    std::vector<uint8_t> code(READ_BYTES);
-    if (m_remote->readMemory(funcAddr, code.data(), code.size()) != (ssize_t)code.size()) {
+    // 只解析函数头部的 ADRP+LDR 指令对，获取 solist_tail 地址
+    uint8_t code[8];
+    if (m_remote->readMemory(funcAddr, code, sizeof(code)) != (ssize_t)sizeof(code)) {
         return false;
     }
 
-    for (size_t off = 0; off + 8 <= code.size(); off += 4) {
-        uint32_t insn = *reinterpret_cast<uint32_t*>(code.data() + off);
-        if (insn == 0xD65F03C0) break;
-        if ((insn & 0x9F000000) != 0x90000000) continue; // ADRP
-        uintptr_t insnAddr = funcAddr + off;
-        uintptr_t page = decodeAdrpImmStatic(insn, insnAddr);
-        uint32_t insn2 = *reinterpret_cast<uint32_t*>(code.data() + off + 4);
-        if ((insn2 & 0xFFC00000) != 0xF9400000) continue; // LDR
-        int rd = insn & 0x1F;
-        int rn = (insn2 >> 5) & 0x1F;
-        int rt = insn2 & 0x1F;
-        if (rn != rd) continue;
-        int size = (insn2 >> 30) & 0x3;
-        uint32_t imm12 = (insn2 >> 10) & 0xFFF;
-        uintptr_t symAddr = page + ((uintptr_t)imm12 << size);
-        uintptr_t symVal = 0;
-        if (m_remote->readMemory(symAddr, &symVal, sizeof(symVal)) != sizeof(symVal)) continue;
+    uint32_t insn = *reinterpret_cast<uint32_t*>(code);
+    uint32_t insn2 = *reinterpret_cast<uint32_t*>(code + 4);
 
-        // search forward for STR X0,[reg,#0x28]
-        for (size_t k = off + 8; k + 4 <= std::min(code.size(), off + 8 + 64); k += 4) {
-            uint32_t insn3 = *reinterpret_cast<uint32_t*>(code.data() + k);
-            if ((insn3 & 0xFFC00000) != 0xF9000000) continue; // STR
-            int rn3 = (insn3 >> 5) & 0x1F;
-            int rt3 = insn3 & 0x1F;
-            int size3 = (insn3 >> 30) & 0x3;
-            uint32_t imm123 = (insn3 >> 10) & 0xFFF;
-            uintptr_t off3 = ((uintptr_t)imm123 << size3);
-            if (rt3 == 0 && rn3 == rt && off3 == 0x28) {
-                if (!m_sonextAddr) {
-                    m_sonextAddr = symAddr;
-                    LOGI("parseSolistAddSoinfo mapped func@%p -> sonext %p", (void*)funcAddr, (void*)symAddr);
-                    return true;
-                }
-            }
-        }
+    // ADRP Xn, #page
+    if ((insn & 0x9F000000) != 0x90000000) return false;
+    // LDR Xt, [Xn, #imm]
+    if ((insn2 & 0xFFC00000) != 0xF9400000) return false;
+
+    int rd = insn & 0x1F;
+    int rn = (insn2 >> 5) & 0x1F;
+    if (rn != rd) return false;
+
+    uintptr_t page = decodeAdrpImmStatic(insn, funcAddr);
+    int size = (insn2 >> 30) & 0x3;
+    uint32_t imm12 = (insn2 >> 10) & 0xFFF;
+    uintptr_t symAddr = page + ((uintptr_t)imm12 << size);
+
+    if (!m_sonextAddr) {
+        m_sonextAddr = symAddr;
+        LOGI("parseSolistAddSoinfo func@%p -> sonext(solist_tail) %p", (void*)funcAddr, (void*)symAddr);
+        return true;
     }
     return false;
 }
