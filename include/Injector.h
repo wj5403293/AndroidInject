@@ -13,6 +13,7 @@ struct InjectorConfig {
     bool useMemfd = false;      // 使用 memfd 注入
     bool hideMaps = false;      // 从 maps 隐藏
     bool hideSolist = false;    // 从 solist 隐藏
+    bool dlcloseHide = false;   // 通过 patch soinfo + dlclose 隐藏（替代 hideSolist）
     bool copyToPrivate = true;  // 复制到目标进程私有目录（避免SELinux限制）
     bool deepObfuscate = false; // 注入后进行深度 ELF 混淆（破坏 dynamic/strtab/symtab 等）
 };
@@ -42,6 +43,7 @@ private:
     // 隐藏功能
     bool hideFromMaps(const ElfParser& elf);
     bool hideFromSolist(const ElfParser& elf);
+    bool hideViaDlclose(uintptr_t handle, const ElfParser& elf);
     
     // 对已注入库的 ELF 头进行改写以防止内存搜索
     bool obfuscateElfHeader(const ElfParser& elf);

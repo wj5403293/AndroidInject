@@ -131,9 +131,10 @@ bool SolistHider::findLinkerSymbols() {
 }
 
 bool SolistHider::findSoinfoOffsets(uintptr_t soinfo) {
-    // 使用固定偏移：base=0x10, next=0x28
+    // 使用固定偏移：base=0x10,size=0x18, next=0x28
     if (!soinfo) return false;
     m_offsets.base = 0x10;
+    m_offsets.size = 0x18;
     m_offsets.next = 0x28;
     m_nextIsIndirect = false;
 
@@ -403,4 +404,68 @@ bool SolistHider::solist_reset_counters(const ElfParser &elf) {
 
     LOGI("reset g_module_load_counter to 0x%lx", (unsigned long)counter);
     return true;
+}
+
+bool SolistHider::patchForDlclose(const ElfParser& elf) {
+    if (!m_offsets.valid) {
+        LOGE("SolistHider not properly initialized");
+        return false;
+    }
+
+    uintptr_t solist = 0;
+    if (m_remote->readMemory(m_solistAddr, &solist, sizeof(solist)) != sizeof(solist)) {
+        LOGE("Failed to read solist");
+        return false;
+    }
+
+    uintptr_t curr = solist;
+    while (curr) {
+        uintptr_t base = readSoinfoField<uintptr_t>(curr, m_offsets.base);
+
+        if (base == elf.base()) {
+            LOGI("Found target soinfo: %p, patching for dlclose hide", (void*)curr);
+
+            constexpr uint32_t GAP_SIZE_OFFSET = 0x250;
+            constexpr uint32_t FINI_ARRAY_COUNT_OFFSET = 0xb0;
+
+            // 读取原始值
+            uintptr_t origSize = readSoinfoField<uintptr_t>(curr, m_offsets.size);
+            uintptr_t origGapSize = readSoinfoField<uintptr_t>(curr, GAP_SIZE_OFFSET);
+            uintptr_t origFiniCount = readSoinfoField<uintptr_t>(curr, FINI_ARRAY_COUNT_OFFSET);
+
+            LOGI("  [before] size=0x%lx, gap_size_=0x%lx, fini_array_count_=0x%lx",
+                 (unsigned long)origSize, (unsigned long)origGapSize, (unsigned long)origFiniCount);
+
+            uintptr_t zero64 = 0;
+
+            // patch size = 0 → soinfo_free 跳过 munmap(base, size)
+            writeSoinfoField(curr, m_offsets.size, zero64);
+            LOGI("  soinfo->size = 0 (offset 0x%x)", m_offsets.size);
+
+            // patch gap_size_ = 0 → 跳过 munmap(gap_start, gap_size)
+            writeSoinfoField(curr, GAP_SIZE_OFFSET, zero64);
+            LOGI("  soinfo->gap_size_ = 0 (offset 0x%x)", GAP_SIZE_OFFSET);
+
+            // patch fini_array_count_ = 0 → call_destructors 跳过 DT_FINI_ARRAY
+            writeSoinfoField(curr, FINI_ARRAY_COUNT_OFFSET, zero64);
+            LOGI("  soinfo->fini_array_count_ = 0 (offset 0x%x)", FINI_ARRAY_COUNT_OFFSET);
+
+            return true;
+        }
+
+        uintptr_t nextField = readSoinfoField<uintptr_t>(curr, m_offsets.next);
+        if (m_nextIsIndirect) {
+            uintptr_t nextNode = 0;
+            if (nextField && m_remote->readMemory(nextField, &nextNode, sizeof(nextNode)) == sizeof(nextNode)) {
+                curr = nextNode;
+            } else {
+                curr = 0;
+            }
+        } else {
+            curr = nextField;
+        }
+    }
+
+    LOGE("Target ELF not found in solist for dlclose patching");
+    return false;
 }

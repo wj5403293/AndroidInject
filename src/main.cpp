@@ -20,6 +20,7 @@ void printUsage(const char* prog) {
     printf("  -H, --hide-maps      Hide from /proc/[pid]/maps\n");
     printf("  -S, --hide-solist    Hide from linker solist\n");
     printf("  -D, --deep-obfuscate Perform deep ELF obfuscation after injection\n");
+    printf("  -C, --dlclose-hide   Hide via patching soinfo + dlclose (alternative to -S)\n");
     printf("  -w, --watch          Watch for process start\n");
     printf("  -d, --delay <us>     Delay before injection (microseconds)\n");
     printf("  -t, --timeout <ms>   Watch timeout (milliseconds)\n");
@@ -40,6 +41,7 @@ int main(int argc, char* argv[]) {
     bool hideMaps = false;
     bool hideSolist = false;
     bool deepObfuscate = false;
+    bool dlcloseHide = false;
     bool watchMode = false;
     bool copyToPrivate = true;  // 默认启用复制到私有目录
     unsigned int delay = 0;
@@ -54,6 +56,7 @@ int main(int argc, char* argv[]) {
         {"hide-maps",   no_argument,       nullptr, 'H'},
         {"hide-solist", no_argument,       nullptr, 'S'},
         {"deep-obfuscate", no_argument, nullptr, 'D'},
+        {"dlclose-hide", no_argument, nullptr, 'C'},
         {"watch",       no_argument,       nullptr, 'w'},
         {"delay",       required_argument, nullptr, 'd'},
         {"timeout",     required_argument, nullptr, 't'},
@@ -63,7 +66,7 @@ int main(int argc, char* argv[]) {
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:l:i:mHSwd:Dt:nh", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:l:i:mHSwd:Dt:nCh", longOpts, nullptr)) != -1) {
         switch (opt) {
             case 'p': pkgName = optarg; break;
             case 'l': libPath = optarg; break;
@@ -72,6 +75,7 @@ int main(int argc, char* argv[]) {
             case 'H': hideMaps = true; break;
             case 'S': hideSolist = true; break;
             case 'D': deepObfuscate = true; break;
+            case 'C': dlcloseHide = true; break;
             case 'w': watchMode = true; break;
             case 'd': delay = atoi(optarg); break;
             case 't': timeout = atoi(optarg); break;
@@ -104,6 +108,7 @@ int main(int argc, char* argv[]) {
     LOGI("Use memfd: %s", useMemfd ? "yes" : "no");
     LOGI("Hide maps: %s", hideMaps ? "yes" : "no");
     LOGI("Hide solist: %s", hideSolist ? "yes" : "no");
+    LOGI("Dlclose hide: %s", dlcloseHide ? "yes" : "no");
     LOGI("Watch mode: %s", watchMode ? "yes" : "no");
     LOGI("Copy to private: %s", copyToPrivate ? "yes" : "no");
     
@@ -160,6 +165,7 @@ int main(int argc, char* argv[]) {
     config.useMemfd = useMemfd;
     config.hideMaps = hideMaps;
     config.hideSolist = hideSolist;
+    config.dlcloseHide = dlcloseHide;
     config.deepObfuscate = deepObfuscate;
     config.dlFlags = RTLD_NOW;
     config.copyToPrivate = copyToPrivate;

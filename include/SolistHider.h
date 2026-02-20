@@ -7,6 +7,7 @@
 // soinfo 结构偏移（需要动态查找）
 struct SoinfoOffsets {
     uint32_t base = 0;      // soinfo->base
+    uint32_t size = 0;
     uint32_t next = 0;      // soinfo->next
     uint32_t flags = 0;     // soinfo->flags
     bool valid = false;
@@ -21,6 +22,9 @@ public:
     
     // 从 linker solist 中移除 ELF
     bool removeFromSolist(const ElfParser& elf);
+
+    // patch soinfo 字段使 dlclose 跳过 munmap 和析构
+    bool patchForDlclose(const ElfParser& elf);
 
     // reset g_module_load_counter
     bool solist_reset_counters(const ElfParser& elf);

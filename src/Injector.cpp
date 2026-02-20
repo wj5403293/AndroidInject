@@ -145,30 +145,49 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
         ElfParser injectedElf;
         if (injectedElf.loadFromMemory(m_pid, result.base)) {
 
-            if (config.hideSolist) {
-                hideFromSolist(injectedElf);
-            }
-            
-            // 隐藏处理
-            if (config.hideMaps) {
-                hideFromMaps(injectedElf);
-            }
- 
-            // 调用 JNI_OnLoad（在 detach 之前）
-            callEntryPoint(result.handle, injectedElf);
+            if (config.dlcloseHide) {
+                // dlclose 隐藏流程:
+                // 1. 先调用入口点（dlclose 后 handle 失效）
+                // 2. patch soinfo 使 dlclose 跳过 munmap/析构
+                // 3. dlclose 让 linker 自动清理 solist/soinfo
+                // 4. maps 隐藏 + ELF 混淆照常执行
+                callEntryPoint(result.handle, injectedElf);
+                hideViaDlclose(result.handle, injectedElf);
 
-            // 在调用入口点后改写 ELF 头与可选的深度混淆
-            if (!obfuscateElfHeader(injectedElf)) {
-                LOGW("ELF header obfuscation failed or skipped");
-            }
-            // 如果配置要求深度混淆，进行进一步破坏性改写
-            // 注意：深度混淆会破坏 ELF 的内在结构（dynamic/strtab/symtab/gnu_hash/phdrs 等）
-            // 仅在确认没有其他依赖并且需要强混淆时启用
-            if (config.deepObfuscate) {
-                if (!obfuscateElfDeep(injectedElf)) {
-                    LOGW("Deep ELF obfuscation failed or skipped");
-                } else {
-                    LOGI("Deep ELF obfuscation applied");
+                if (config.hideMaps) {
+                    hideFromMaps(injectedElf);
+                }
+                if (!obfuscateElfHeader(injectedElf)) {
+                    LOGW("ELF header obfuscation failed or skipped");
+                }
+                if (config.deepObfuscate) {
+                    if (!obfuscateElfDeep(injectedElf)) {
+                        LOGW("Deep ELF obfuscation failed or skipped");
+                    } else {
+                        LOGI("Deep ELF obfuscation applied");
+                    }
+                }
+            } else {
+                // 原始流程: solist 隐藏 → maps 隐藏 → 入口点 → 混淆
+                if (config.hideSolist) {
+                    hideFromSolist(injectedElf);
+                }
+
+                if (config.hideMaps) {
+                    hideFromMaps(injectedElf);
+                }
+
+                callEntryPoint(result.handle, injectedElf);
+
+                if (!obfuscateElfHeader(injectedElf)) {
+                    LOGW("ELF header obfuscation failed or skipped");
+                }
+                if (config.deepObfuscate) {
+                    if (!obfuscateElfDeep(injectedElf)) {
+                        LOGW("Deep ELF obfuscation failed or skipped");
+                    } else {
+                        LOGI("Deep ELF obfuscation applied");
+                    }
                 }
             }
         } else {
@@ -575,7 +594,7 @@ bool Injector::hideFromMaps(const ElfParser& elf) {
 
 bool Injector::hideFromSolist(const ElfParser& elf) {
     LOGI("Hiding library from solist...");
-    
+
     if (!m_solistHider) {
         m_solistHider = std::make_unique<SolistHider>(m_remote.get());
         if (!m_solistHider->init()) {
@@ -583,8 +602,44 @@ bool Injector::hideFromSolist(const ElfParser& elf) {
             return false;
         }
     }
-    
+
     return m_solistHider->removeFromSolist(elf);
+}
+
+bool Injector::hideViaDlclose(uintptr_t handle, const ElfParser& elf) {
+    LOGI("Hiding library via dlclose (patch soinfo + dlclose)...");
+
+    if (!m_remoteDlclose) {
+        LOGE("Remote dlclose not available");
+        return false;
+    }
+
+    // 初始化 SolistHider 以定位 soinfo
+    if (!m_solistHider) {
+        m_solistHider = std::make_unique<SolistHider>(m_remote.get());
+        if (!m_solistHider->init()) {
+            LOGE("Failed to initialize SolistHider for dlclose hide");
+            return false;
+        }
+    }
+
+    // patch soinfo: size=0, gap_size_=0, fini_array_count_=0
+    if (!m_solistHider->patchForDlclose(elf)) {
+        LOGE("Failed to patch soinfo for dlclose hide");
+        return false;
+    }
+
+    // 远程调用 dlclose(handle)
+    // linker 会: 跳过 munmap (size==0) → 摘除 solist → 释放 soinfo
+    LOGI("Calling remote dlclose(%p)...", (void*)handle);
+    uintptr_t ret = m_remote->callFunctionFrom(0, m_remoteDlclose, 1, handle);
+    LOGI("dlclose returned: %ld", (long)ret);
+
+    if (ret != 0) {
+        LOGW("dlclose returned non-zero: %ld", (long)ret);
+    }
+
+    return true;
 }
 
 // 将注入库的 ELF 头进行改写，主要是修改 e_ident 的魔数与部分字段，目的是降低通过简单内存搜索检测到注入库的概率
